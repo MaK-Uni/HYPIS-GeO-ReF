@@ -1,5 +1,5 @@
 """
-HyPIS Ug  v7.7  — Bug-Fixed
+HyPIS Ug  v7.8  — FAO-56 + XGBoost ML Integration
 ═══════════════════════════════════════════════════════════════════════════════
 FIXES in v7.7 (over v7.6):
   ✔ CRITICAL — Leading space removed from " Kampala (Makerere Uni)" key in
@@ -34,7 +34,7 @@ FIXES in v7.5 (retained):
   ✔ SM% rounding uses round(...,1) not int() truncation.
   ✔ estimate_sm uses ETc = Kc×ET₀.
 
-Author: Prosper BYARUHANGA · HyPIS App v7.7 · FAO-56 PM
+Author: Prosper BYARUHANGA · HyPIS App v7.8 · FAO-56 PM + XGBoost ML
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -163,7 +163,8 @@ _W2M     = 4.87 / np.log(67.8 * 10.0 - 5.42)
 ML_MODEL    = None
 ML_OK       = False
 ML_STATUS   = ""
-ML_FEATURES = ["tmean","rh","wind","kc","precipitation","soil_fc","soil_pwp","root_depth"]
+# v7.8: 7 features matching the trained XGBRegressor (soil_pwp was listed but absent from model)
+ML_FEATURES = ["tmean","rh","wind","kc","precipitation","soil_fc","root_depth"]
 _MODEL_PATH = pathlib.Path(_HERE) / "irrigation_xgboost_model_with_soil.pkl"
 
 def _load_ml_model():
@@ -179,6 +180,54 @@ def _load_ml_model():
         ML_STATUS = f"⚠️ {e}"
 
 _load_ml_model()
+
+def ml_predict_iwr(tmean, rh, wind, kc, precipitation, soil_fc, root_depth, taw=None):
+    """
+    Call the XGBRegressor to predict NIR (net irrigation requirement, mm/day).
+    Returns predicted value clipped to [0, TAW] (or [0, 50] as safe fallback).
+    Returns None if model unavailable.
+
+    Features (in order, matching the trained model):
+      tmean        – mean daily air temperature (°C)
+      rh           – mean relative humidity (%)
+      wind         – wind speed at 2m (m/s)
+      kc           – crop coefficient
+      precipitation– daily rainfall (mm)
+      soil_fc      – field capacity (volumetric, 0-1)
+      root_depth   – rooting depth (m)
+    """
+    if not ML_OK or ML_MODEL is None:
+        return None
+    try:
+        import numpy as np
+        import pandas as pd
+        X = pd.DataFrame([[
+            float(tmean), float(rh), float(wind), float(kc),
+            float(precipitation), float(soil_fc), float(root_depth)
+        ]], columns=ML_FEATURES)
+        pred = float(ML_MODEL.predict(X)[0])
+        upper = float(taw) if taw and taw > 0 else 50.0
+        return round(max(0.0, min(upper, pred)), 3)
+    except Exception:
+        return None
+
+def ml_agreement(fao_val, ml_val):
+    """
+    Classify agreement between FAO-56 and ML prediction.
+    Returns (css_class, icon, label, pct_diff).
+    """
+    if ml_val is None:
+        return "ml-panel", "🤖", "ML unavailable", None
+    if fao_val <= 0 and ml_val <= 0:
+        return "ml-agree", "✅", "Both agree: no irrigation", 0.0
+    ref = max(fao_val, ml_val, 0.1)
+    pct = abs(fao_val - ml_val) / ref * 100
+    if pct <= 15:
+        return "ml-agree", "✅", f"Strong agreement ({pct:.0f}% diff)", pct
+    if pct <= 35:
+        return "ml-warn", "⚠️", f"Minor deviation ({pct:.0f}% diff)", pct
+    return "ml-diff", "❌", f"Significant deviation ({pct:.0f}% diff)", pct
+
 
 crop_params = {
     "Tomatoes":       {"ini":0.60,"mid":1.15,"end":0.80,"zr":0.70,"mad":0.40},
@@ -279,6 +328,10 @@ button[title="Fork this app"],[data-testid="stToolbarActionButtonIcon"],
 .live-dot{width:7px;height:7px;background:#22c55e;border-radius:50%;
   display:inline-block;margin-right:4px;animation:blink 1.4s infinite;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+.ml-agree{background:#e8f5e9;border:1.5px solid #43a047;border-radius:10px;padding:8px 14px;font-size:.87rem;margin:4px 0;}
+.ml-warn{background:#fff8e1;border:1.5px solid #ffa000;border-radius:10px;padding:8px 14px;font-size:.87rem;margin:4px 0;}
+.ml-diff{background:#ffebee;border:1.5px solid #c62828;border-radius:10px;padding:8px 14px;font-size:.87rem;margin:4px 0;}
+.ml-panel{background:#f3f0ff;border:1px solid #7c4dff;border-radius:10px;padding:8px 14px;font-size:.87rem;margin:4px 0;}
 </style>""", unsafe_allow_html=True)
 
 if "last_refresh" not in st.session_state:
@@ -296,7 +349,7 @@ st.markdown("""<div class="hx-outer"><div class="hx-panel"><div class="hx-row">
   <span class="H">H</span><span class="y">y</span><span class="P">P</span>
   <span class="I">I</span><span class="S">S</span><span class="Ug"> Ug</span>
 </span>
-<span class="hx-sub">HydroPredict · IrrigSched · Uganda Multi-Location IWR v7.7</span>
+<span class="hx-sub">HydroPredict · IrrigSched · Uganda Multi-Location IWR v7.8</span>
 </div></div>
 <div class="hx-auth">by: Prosper <strong>BYARUHANGA</strong>
 &nbsp;·&nbsp; HyPIS App v7.7 &nbsp;·&nbsp; FAO-56 PM · Soil-adjusted MAD · Uganda</div>
@@ -356,9 +409,21 @@ st.sidebar.markdown("---\n### 📐 Field & Pump")
 area_ha   = st.sidebar.number_input("Field Area (ha)",       value=1.0, min_value=0.1, step=0.1, key="area_g")
 pump_flow = st.sidebar.number_input("Pump Flow Rate (m³/hr)",value=5.0, min_value=0.5, step=0.5, key="pump_g")
 
+st.sidebar.markdown("---\n### 🤖 XGBoost ML Model")
 if ML_OK:
-    st.sidebar.markdown("---")
-    st.sidebar.caption(f"🤖 ML model loaded (unused — FAO-56 rule-based decisions only)")
+    st.sidebar.success(
+        f"**{ML_STATUS}**  \n"
+        f"**Type:** XGBRegressor (1000 trees)  \n"
+        f"**Output:** Predicted NIR (mm/day)  \n"
+        f"**Features ({len(ML_FEATURES)}):** `{'`, `'.join(ML_FEATURES)}`  \n"
+        f"**Role:** Cross-checks FAO-56 IWR · agreement shown in results"
+    )
+else:
+    st.sidebar.warning(
+        f"{ML_STATUS}  \n"
+        f"Place `irrigation_xgboost_model_with_soil.pkl` next to `app.py`  \n"
+        f"FAO-56 results remain fully functional."
+    )
 
 # ── GEO PANEL ─────────────────────────────────────────────────────────────────
 st.markdown(
@@ -520,13 +585,22 @@ def run_water_balance(daily_df, crop, soil, planting_ts, sm_pct,
         prec_col = "precipitation"
         df[prec_col] = 0.
 
-    dr_vals=[]; nir_vals=[]; iwr_vals=[]; status_vals=[]; sm_vals=[]; note_vals=[]
+    dr_vals=[]; nir_vals=[]; iwr_vals=[]; status_vals=[]; sm_vals=[]; note_vals=[]; ml_nir_vals=[]
 
     for _, row in df.iterrows():
         pe_r   = row["Pe"];  etc_r  = row["ETc"]
         # Update depletion: subtract Pe (rain refill) then add ETc (crop use)
         dr_new = max(0., min(taw, dr - pe_r + etc_r))
         nir_day = round(max(0., etc_r - pe_r), 3)
+
+        # ML cross-check prediction for this day
+        _tmean = (row["tmax"] + row["tmin"]) / 2.
+        _rh    = row.get("rh_mean", 60.)
+        _wind  = row.get("wind", 1.5)
+        _prec  = row.get("precipitation", row.get("precip", 0.))
+        _ml_nir = ml_predict_iwr(_tmean, _rh, _wind, row["kc"],
+                                  _prec, soil["fc"], zr, taw=taw)
+        ml_nir_vals.append(round(_ml_nir, 3) if _ml_nir is not None else None)
 
         # FIX v7.6: pass only dr_new, raw, taw — rain already in dr_new
         # FIX v7.7: also pass Ef so Monitor note shows pre-emptive volume
@@ -554,6 +628,7 @@ def run_water_balance(daily_df, crop, soil, planting_ts, sm_pct,
     df["IWR"]     = iwr_vals
     df["Status"]  = status_vals
     df["Note"]    = note_vals
+    df["ML_NIR"]  = ml_nir_vals  # v7.8: XGBoost cross-check (None when model unavailable)
     return df, taw, raw
 
 # ── SOIL MOISTURE ESTIMATION — ERA5 10-day back-run ──────────────────────────
@@ -772,7 +847,7 @@ with tab1:
     st.header(f"📊 Today's IWR — {SITE_NAME}")
     st.caption(
         f"📡 {wx['source'] if wx else 'Weather unavailable'} · "
-        f"FAO-56 PM v7.7 · Trigger: Dr > RAW (soil depleted past MAD) · "
+        f"FAO-56 PM + XGBoost ML v7.8 · Trigger: Dr > RAW (soil depleted past MAD) · "
         f"Rain already accounted for in depletion update · All values per 24-hour day"
     )
 
@@ -1087,7 +1162,12 @@ with tab1:
             f"(crop MAD {cp1['mad']:.2f} → soil-adj. **{mad_eff1:.2f}**)"
         )
 
-        r1,r2,r3,r4,r5,r6,r7 = st.columns(7)
+        # v7.8: get ML prediction for today
+        _ml_today = ml_predict_iwr(
+            (tmax_in+tmin_in)/2., rh_in, wind_in, kc1,
+            prec_in, ACTIVE_FC, cp1["zr"], taw=taw1)
+
+        r1,r2,r3,r4,r5,r6,r7,r8 = st.columns(8)
         r1.metric("ET₀ PM mm/d",   f"{et0_fao:.2f}")
         r2.metric("ET₀ H mm/d",    f"{et0_h:.2f}")
         r3.metric("ETc mm/d",      f"{etc1:.2f}", f"Kc={kc1:.3f}")
@@ -1095,8 +1175,30 @@ with tab1:
         r5.metric("NIR mm/d",      f"{nir1_day:.2f}", "ETc − Pe")
         r6.metric("Dr mm",         f"{dr_today:.2f}", f"RAW={raw1:.1f}")
         r7.metric("SM % FC",       f"{sm_now:.1f}%", f"→{sm_aft:.1f}% after")
+        if _ml_today is not None:
+            r8.metric("🤖 ML NIR mm/d", f"{_ml_today:.2f}",
+                      f"FAO={nir1_day:.2f}")
+        else:
+            r8.metric("🤖 ML NIR mm/d", "N/A", "model not loaded")
 
         st.markdown("---")
+
+        # v7.8: ML vs FAO-56 agreement panel
+        _ml_css, _ml_icon, _ml_lbl, _ml_pct = ml_agreement(nir1_day, _ml_today)
+        _ml_txt = (
+            f"<b>🤖 XGBoost ML Cross-Check</b> · "
+            f"Predicted NIR = <b>{_ml_today:.2f} mm/d</b> &nbsp;| "
+            f"FAO-56 NIR = <b>{nir1_day:.2f} mm/d</b> &nbsp;| "
+            f"{_ml_icon} <b>{_ml_lbl}</b>"
+            if _ml_today is not None else
+            "<b>🤖 XGBoost ML</b> · Model not available — "
+            "FAO-56 result is authoritative")
+        if _ml_today is not None and _ml_pct is not None and _ml_pct > 35:
+            _ml_txt += (
+                f"<br><small>⚠️ Large deviation: FAO-56 uses full soil-water "
+                f"balance (Dr, Pe, ETc, MAD) while ML was trained on simplified features. "
+                f"Trust FAO-56 for the irrigation <i>trigger</i>; ML shows pattern-based estimate.</small>")
+        st.markdown(f'<div class="{_ml_css}">{_ml_txt}</div>', unsafe_allow_html=True)
 
         if irrigate:
             st.markdown(
@@ -1156,6 +1258,7 @@ with tab1:
             "RAW mm":               round(raw1,1),
             "MAD adj":              round(mad_eff1,3),
             "Status":               status_lbl,
+            "ML NIR mm":            round(_ml_today, 3) if _ml_today is not None else None,
         }], index=[datetime.today().strftime("%Y-%m-%d (%a)")])
 
         # explicit format — no 6-decimal columns
@@ -1176,6 +1279,7 @@ with tab1:
             "TAW mm":        "{:.1f}",
             "RAW mm":        "{:.1f}",
             "MAD adj":       "{:.3f}",
+            "ML NIR mm":     "{:.3f}",
         }
         st.dataframe(today_tbl.style.format(_today_fmt, na_rep="—"),
                      use_container_width=True)
@@ -1312,14 +1416,14 @@ with tab2:
             st.subheader("📋 5-Day Forecast Table")
             cols_fc = ["tmax","tmin","rh_mean","precipitation","Pe",
                        "ET0","kc","ETc","Dr_mm","SM_pct",
-                       "NIR","IWR","Vol_m3","Vol_L","PumpMin","Status"]
+                       "NIR","ML_NIR","IWR","Vol_m3","Vol_L","PumpMin","Status"]
             tb2 = daily_r[[c for c in cols_fc if c in daily_r.columns]].copy()
             tb2.rename(columns={
                 "tmax":"Tmax °C","tmin":"Tmin °C","rh_mean":"RH %",
                 "precipitation":"Rain mm","Pe":"Pe mm",
                 "ET0":"ET₀ mm/d","kc":"Kc","ETc":"ETc mm/d",
                 "Dr_mm":"Dr mm","SM_pct":"SM %FC",
-                "NIR":"NIR mm","IWR":"IWR mm",
+                "NIR":"NIR mm","ML_NIR":"🤖 ML NIR mm","IWR":"IWR mm",
                 "Vol_m3":"Vol m³","Vol_L":"Vol L",
                 "PumpMin":"Pump min","Status":"Status",
             }, inplace=True)
@@ -1330,6 +1434,7 @@ with tab2:
                 "Kc":      "{:.3f}", "ETc mm/d":"{:.2f}", "Dr mm":   "{:.2f}",
                 "SM %FC":  "{:.1f}", "NIR mm":  "{:.2f}", "IWR mm":  "{:.2f}",
                 "Vol m³":  "{:.1f}", "Vol L":   "{:.0f}", "Pump min":"{:.1f}",
+                "🤖 ML NIR mm": "{:.2f}",
             }
             st.dataframe(tb2.style.format(_tb2_fmt, na_rep="—"), use_container_width=True)
 
@@ -1347,6 +1452,14 @@ with tab2:
                           name="IWR mm", marker_color="#17a2b8",opacity=0.7,yaxis="y2")
             fig2d.add_bar(x=daily_r.index.strftime("%a %d"), y=daily_r["NIR"].astype(float),
                           name="NIR mm/d", marker_color="#0b6b1b",opacity=0.5,yaxis="y2")
+            # v7.8: ML NIR overlay line
+            if "ML_NIR" in daily_r.columns and daily_r["ML_NIR"].notna().any():
+                fig2d.add_scatter(
+                    x=daily_r.index.strftime("%a %d"),
+                    y=daily_r["ML_NIR"].astype(float),
+                    mode="lines+markers", name="🤖 ML NIR mm",
+                    line=dict(color="#7c4dff", width=2, dash="dot"),
+                    marker=dict(size=7, symbol="diamond"), yaxis="y2")
             fig2d.add_hline(y=raw2,line_dash="dash",line_color="#756bb1",
                             annotation_text=f"RAW={raw2:.1f} mm")
             fig2d.add_hline(y=taw2,line_dash="dot", line_color="#d73027",
@@ -1437,6 +1550,15 @@ with tab3:
             hist_r["ET0_H"]   = [et0_hargreaves(r["tmax"],r["tmin"],
                                   doy=int(d.strftime("%j")),lat_deg=LAT)
                                  for d,r in hist_r.iterrows()]
+            # v7.8: ML cross-check per row (already in ML_NIR from run_water_balance,
+            # but recompute explicitly here to ensure it's populated)
+            if "ML_NIR" not in hist_r.columns or hist_r["ML_NIR"].isna().all():
+                hist_r["ML_NIR"] = [
+                    ml_predict_iwr(
+                        (r["tmax"]+r["tmin"])/2., r.get("rh_mean",60.),
+                        r.get("wind",1.5), r.get("kc", cp3["mid"]),
+                        r.get("precipitation",0.), ACTIVE_FC, cp3["zr"], taw=taw3)
+                    for _,r in hist_r.iterrows()]
             hist_r["PumpMin"] = hist_r["Vol_m3"].apply(
                 lambda v: round(float(v)/pump_flow*60,1) if pump_flow>0 and float(v)>0 else 0)
 
@@ -1445,7 +1567,10 @@ with tab3:
                 f"(MAD {cp3['mad']:.2f}→{mad3:.2f})  \n"
                 f"Irrigation fires when Dr > {raw3:.1f} mm")
 
-            m1,m2,m3,m4,m5,m6,m7 = st.columns(7)
+            _ml_h_col = hist_r["ML_NIR"].dropna()
+            _ml_h_mean = _ml_h_col.mean() if len(_ml_h_col) else None
+            _ml_h_dev = (abs(hist_r["NIR"] - hist_r["ML_NIR"].fillna(hist_r["NIR"]))).mean() if ML_OK else None
+            m1,m2,m3,m4,m5,m6,m7,m8 = st.columns(8)
             m1.metric("📆 Days",       len(hist_r))
             m2.metric("🌧️ Rain Total", f"{hist_r['precipitation'].sum():.1f} mm")
             m3.metric("💧 NIR Total",  f"{hist_r['NIR'].sum():.1f} mm")
@@ -1453,27 +1578,34 @@ with tab3:
             m5.metric("🪣 Vol Total",  f"{hist_r['Vol_m3'].sum():.1f} m³")
             m6.metric("🚿 Irrig Days", str((hist_r["IWR"]>0).sum()))
             m7.metric("🌧️ Rain Days",  str((hist_r["precipitation"]>1).sum()))
+            if ML_OK and _ml_h_dev is not None:
+                m8.metric("🤖 ML Avg Dev", f"{_ml_h_dev:.2f} mm",
+                          f"ML mean NIR {_ml_h_mean:.2f} mm" if _ml_h_mean else "n/a")
+            else:
+                m8.metric("🤖 ML", "N/A", "model not loaded")
 
             st.subheader("📋 Historical Table")
-            ht = hist_r[[
-                "tmax","tmin","rh_mean","precipitation","Pe",
-                "ET0","ET0_H","kc","ETc","Dr_mm","SM_pct",
-                "NIR","IWR","Vol_m3","Vol_L","PumpMin","Status","Note"
-            ]].copy()
-            ht.columns = [
-                "Tmax °C","Tmin °C","RH %","Rain mm","Pe mm",
-                "ET₀ PM mm","ET₀ H mm","Kc","ETc mm/d",
-                "Dr mm","SM %FC",
-                "NIR mm","IWR mm","Vol m³","Vol L",
-                "Pump min","Status","Decision Note"
-            ]
+            _ht_sel = ["tmax","tmin","rh_mean","precipitation","Pe",
+                       "ET0","ET0_H","kc","ETc","Dr_mm","SM_pct",
+                       "NIR","ML_NIR","IWR","Vol_m3","Vol_L","PumpMin","Status","Note"]
+            ht = hist_r[[c for c in _ht_sel if c in hist_r.columns]].copy()
+            _ht_col_map = {
+                "tmax":"Tmax °C","tmin":"Tmin °C","rh_mean":"RH %",
+                "precipitation":"Rain mm","Pe":"Pe mm",
+                "ET0":"ET₀ PM mm","ET0_H":"ET₀ H mm","kc":"Kc","ETc":"ETc mm/d",
+                "Dr_mm":"Dr mm","SM_pct":"SM %FC",
+                "NIR":"NIR mm","ML_NIR":"🤖 ML NIR mm","IWR":"IWR mm",
+                "Vol_m3":"Vol m³","Vol_L":"Vol L",
+                "PumpMin":"Pump min","Status":"Status","Note":"Decision Note",
+            }
+            ht.rename(columns=_ht_col_map, inplace=True)
             ht.index = ht.index.strftime("%Y-%m-%d (%a)")
             _ht_fmt = {
                 "Tmax °C":   "{:.1f}", "Tmin °C":   "{:.1f}", "RH %":      "{:.0f}",
                 "Rain mm":   "{:.1f}", "Pe mm":      "{:.2f}",
                 "ET₀ PM mm": "{:.2f}", "ET₀ H mm":  "{:.2f}", "Kc":        "{:.3f}",
                 "ETc mm/d":  "{:.2f}", "Dr mm":      "{:.2f}", "SM %FC":    "{:.1f}",
-                "NIR mm":    "{:.2f}", "IWR mm":     "{:.2f}",
+                "NIR mm":    "{:.2f}", "🤖 ML NIR mm": "{:.2f}", "IWR mm": "{:.2f}",
                 "Vol m³":    "{:.1f}", "Vol L":      "{:.0f}", "Pump min":  "{:.1f}",
             }
             st.dataframe(ht.style.format(_ht_fmt, na_rep="—"), use_container_width=True)
@@ -1487,6 +1619,12 @@ with tab3:
                           name="IWR mm",marker_color="#17a2b8",opacity=0.7,yaxis="y2")
             fig3d.add_bar(x=hist_r.index,y=hist_r["NIR"].astype(float),
                           name="NIR mm/d",marker_color="#0b6b1b",opacity=0.4,yaxis="y2")
+            # v7.8: ML NIR overlay
+            if "ML_NIR" in hist_r.columns and hist_r["ML_NIR"].notna().any():
+                fig3d.add_scatter(x=hist_r.index, y=hist_r["ML_NIR"].astype(float),
+                                  mode="lines", name="🤖 ML NIR mm",
+                                  line=dict(color="#7c4dff",width=1.5,dash="dot"),
+                                  yaxis="y2")
             fig3d.add_hline(y=raw3,line_dash="dash",line_color="#756bb1",
                             annotation_text=f"RAW={raw3:.1f} mm — irrigate above")
             fig3d.add_hline(y=taw3,line_dash="dot", line_color="#d73027",
@@ -1536,7 +1674,7 @@ with tab3:
 # ── FOOTER ────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.caption(
-    f"HyPIS Ug v7.7 · {SITE_NAME} ({LAT}°, {LON}°, {ELEV} m) · "
+    f"HyPIS Ug v7.8 · {SITE_NAME} ({LAT}°, {LON}°, {ELEV} m) · "
     f"ERA5+ICON+GFS (Open-Meteo) · FAO-56 Penman-Monteith · "
     f"Soil-adjusted MAD (FAO-56 ±5–10% texture) · "
     f"Trigger: Dr > RAW (canonical FAO-56 §8) · "
